@@ -1,20 +1,15 @@
 use anchor_lang::prelude::*;
-use anchor_spl::metadata::{
-    create_metadata_accounts_v3, mpl_token_metadata::types::DataV2, CreateMetadataAccountsV3,
-    Metadata,
-};
-use anchor_spl::token::{Mint, Token};
+use anchor_spl::token::{self, Token};
 
 declare_id!("Xxf3vRZE7MbcRgGHYc7baYQuvq6sjYCNmpKzMpKCPep");
 
-// Program constants
 pub const MAX_COORDINATE: i32 = 10000;
 pub const MIN_COORDINATE: i32 = -10000;
 pub const MAX_URI_LENGTH: usize = 200;
 pub const MAX_NAME_LENGTH: usize = 32;
-pub const MARKETPLACE_FEE_BASIS_POINTS: u16 = 250; // 2.5%
-pub const MIN_PRICE: u64 = 1_000_000; // 0.001 SOL minimum
-pub const LISTING_DURATION_SECONDS: i64 = 30 * 24 * 60 * 60; // 30 days
+pub const MARKETPLACE_FEE_BASIS_POINTS: u16 = 250;
+pub const MIN_PRICE: u64 = 1_000_000;
+pub const LISTING_DURATION_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[program]
 pub mod moqayada {
@@ -24,7 +19,7 @@ pub mod moqayada {
         ctx: Context<InitializeMarketplace>,
         fee_percentage: u16,
     ) -> Result<()> {
-        require!(fee_percentage <= 1000, ErrorCode::FeeTooHigh); // Max 10%
+        require!(fee_percentage <= 1000, ErrorCode::FeeTooHigh);
 
         let marketplace = &mut ctx.accounts.marketplace;
         marketplace.authority = ctx.accounts.authority.key();
@@ -52,7 +47,6 @@ pub mod moqayada {
         name: String,
         uri: String,
     ) -> Result<()> {
-        // Validate inputs
         require!(
             coordinates.x >= MIN_COORDINATE && coordinates.x <= MAX_COORDINATE,
             ErrorCode::InvalidCoordinates
@@ -64,46 +58,48 @@ pub mod moqayada {
         require!(name.len() <= MAX_NAME_LENGTH, ErrorCode::NameTooLong);
         require!(uri.len() <= MAX_URI_LENGTH, ErrorCode::UriTooLong);
 
-        // Initialize land parcel
+        let mint_account_size = 82u64;
+        let rent = Rent::get()?;
+        let lamports_required = rent.minimum_balance(mint_account_size as usize);
+
+        anchor_lang::system_program::create_account(
+            CpiContext::new(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            lamports_required,
+            mint_account_size,
+            &ctx.accounts.token_program.key(),
+        )?;
+
+        token::initialize_mint(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                token::InitializeMint {
+                    mint: ctx.accounts.mint.to_account_info(),
+                    rent: ctx.accounts.rent.to_account_info(),
+                },
+            ),
+            0,
+            &ctx.accounts.payer.key(),
+            Some(&ctx.accounts.payer.key()),
+        )?;
+
         let land_parcel = &mut ctx.accounts.land_parcel;
         land_parcel.mint = ctx.accounts.mint.key();
         land_parcel.owner = ctx.accounts.owner.key();
         land_parcel.coordinates = coordinates;
         land_parcel.size = size;
         land_parcel.rarity = rarity;
-        land_parcel.metadata_uri = uri.clone();
+        land_parcel.metadata_uri = uri;
         land_parcel.created_at = Clock::get()?.unix_timestamp;
         land_parcel.is_listed = false;
         land_parcel.total_trades = 0;
         land_parcel.last_sale_price = 0;
 
-        // Create NFT metadata
-        let metadata_ctx = CpiContext::new(
-            ctx.accounts.token_metadata_program.to_account_info(),
-            CreateMetadataAccountsV3 {
-                metadata: ctx.accounts.metadata.to_account_info(),
-                mint: ctx.accounts.mint.to_account_info(),
-                mint_authority: ctx.accounts.payer.to_account_info(),
-                update_authority: ctx.accounts.payer.to_account_info(),
-                payer: ctx.accounts.payer.to_account_info(),
-                system_program: ctx.accounts.system_program.to_account_info(),
-                rent: ctx.accounts.rent.to_account_info(),
-            },
-        );
-
-        let metadata_data = DataV2 {
-            name,
-            symbol: "LAND".to_string(),
-            uri,
-            seller_fee_basis_points: 0,
-            creators: None,
-            collection: None,
-            uses: None,
-        };
-
-        create_metadata_accounts_v3(metadata_ctx, metadata_data, false, true, None)?;
-
-        // Update marketplace stats
         let marketplace = &mut ctx.accounts.marketplace;
         marketplace.total_parcels_minted = marketplace
             .total_parcels_minted
@@ -149,10 +145,8 @@ pub mod moqayada {
         listing.status = ListingStatus::Active;
         listing.bump = ctx.bumps.listing;
 
-        // Update parcel status
         land_parcel.is_listed = true;
 
-        // Update marketplace stats
         let marketplace = &mut ctx.accounts.marketplace;
         marketplace.active_listings = marketplace
             .active_listings
@@ -178,7 +172,6 @@ pub mod moqayada {
             ErrorCode::ListingNotActive
         );
 
-        // Check if listing has expired
         if let Some(expiry) = listing.expires_at {
             require!(
                 Clock::get()?.unix_timestamp <= expiry,
@@ -189,7 +182,6 @@ pub mod moqayada {
         let price = listing.price;
         let marketplace = &ctx.accounts.marketplace;
 
-        // Calculate marketplace fee
         let fee_amount = price
             .checked_mul(marketplace.fee_percentage as u64)
             .ok_or(ErrorCode::MathOverflow)?
@@ -200,7 +192,6 @@ pub mod moqayada {
             .checked_sub(fee_amount)
             .ok_or(ErrorCode::MathOverflow)?;
 
-        // Transfer SOL to seller
         let transfer_to_seller = anchor_lang::system_program::Transfer {
             from: ctx.accounts.buyer.to_account_info(),
             to: ctx.accounts.seller.to_account_info(),
@@ -213,7 +204,6 @@ pub mod moqayada {
             seller_amount,
         )?;
 
-        // Transfer fee to treasury
         if fee_amount > 0 {
             let transfer_to_treasury = anchor_lang::system_program::Transfer {
                 from: ctx.accounts.buyer.to_account_info(),
@@ -228,7 +218,6 @@ pub mod moqayada {
             )?;
         }
 
-        // Update parcel ownership
         land_parcel.owner = ctx.accounts.buyer.key();
         land_parcel.is_listed = false;
         land_parcel.total_trades = land_parcel
@@ -237,10 +226,8 @@ pub mod moqayada {
             .ok_or(ErrorCode::MathOverflow)?;
         land_parcel.last_sale_price = price;
 
-        // Update listing status
         listing.status = ListingStatus::Sold;
 
-        // Update marketplace stats
         let marketplace = &mut ctx.accounts.marketplace;
         marketplace.active_listings = marketplace
             .active_listings
@@ -271,13 +258,9 @@ pub mod moqayada {
             ErrorCode::ListingNotActive
         );
 
-        // Update listing status
         listing.status = ListingStatus::Cancelled;
-
-        // Update parcel status
         land_parcel.is_listed = false;
 
-        // Update marketplace stats
         let marketplace = &mut ctx.accounts.marketplace;
         marketplace.active_listings = marketplace
             .active_listings
@@ -296,7 +279,7 @@ pub mod moqayada {
         ctx: Context<UpdateMarketplaceFee>,
         new_fee_percentage: u16,
     ) -> Result<()> {
-        require!(new_fee_percentage <= 1000, ErrorCode::FeeTooHigh); // Max 10%
+        require!(new_fee_percentage <= 1000, ErrorCode::FeeTooHigh);
 
         let marketplace = &mut ctx.accounts.marketplace;
         let old_fee = marketplace.fee_percentage;
@@ -311,52 +294,41 @@ pub mod moqayada {
     }
 }
 
-// ============================================================================
-// Account Structures
-// ============================================================================
-
 #[account]
 pub struct Marketplace {
-    pub authority: Pubkey,         // 32 bytes
-    pub fee_percentage: u16,       // 2 bytes (basis points)
-    pub treasury: Pubkey,          // 32 bytes
-    pub total_volume: u64,         // 8 bytes
-    pub active_listings: u32,      // 4 bytes
-    pub total_parcels_minted: u64, // 8 bytes
-    pub bump: u8,                  // 1 byte
-                                   // Total: 87 bytes + 8 (discriminator) = 95 bytes
+    pub authority: Pubkey,
+    pub fee_percentage: u16,
+    pub treasury: Pubkey,
+    pub total_volume: u64,
+    pub active_listings: u32,
+    pub total_parcels_minted: u64,
+    pub bump: u8,
 }
 
 #[account]
 pub struct LandParcel {
-    pub mint: Pubkey,             // 32 bytes
-    pub owner: Pubkey,            // 32 bytes
-    pub coordinates: Coordinates, // 8 bytes
-    pub size: ParcelSize,         // 1 byte
-    pub rarity: Rarity,           // 1 byte
-    pub metadata_uri: String,     // 4 + MAX_URI_LENGTH (204 bytes)
-    pub created_at: i64,          // 8 bytes
-    pub is_listed: bool,          // 1 byte
-    pub total_trades: u32,        // 4 bytes
-    pub last_sale_price: u64,     // 8 bytes
-                                  // Total: ~299 bytes + 8 (discriminator) = ~307 bytes
+    pub mint: Pubkey,
+    pub owner: Pubkey,
+    pub coordinates: Coordinates,
+    pub size: ParcelSize,
+    pub rarity: Rarity,
+    pub metadata_uri: String,
+    pub created_at: i64,
+    pub is_listed: bool,
+    pub total_trades: u32,
+    pub last_sale_price: u64,
 }
 
 #[account]
 pub struct Listing {
-    pub seller: Pubkey,          // 32 bytes
-    pub parcel_mint: Pubkey,     // 32 bytes
-    pub price: u64,              // 8 bytes
-    pub created_at: i64,         // 8 bytes
-    pub expires_at: Option<i64>, // 1 + 8 bytes
-    pub status: ListingStatus,   // 1 byte
-    pub bump: u8,                // 1 byte
-                                 // Total: 91 bytes + 8 (discriminator) = 99 bytes
+    pub seller: Pubkey,
+    pub parcel_mint: Pubkey,
+    pub price: u64,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub status: ListingStatus,
+    pub bump: u8,
 }
-
-// ============================================================================
-// Custom Types and Enums
-// ============================================================================
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Coordinates {
@@ -366,10 +338,10 @@ pub struct Coordinates {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq)]
 pub enum ParcelSize {
-    Small,  // 1x1
-    Medium, // 2x2
-    Large,  // 4x4
-    XLarge, // 8x8
+    Small,
+    Medium,
+    Large,
+    XLarge,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq)]
@@ -388,10 +360,6 @@ pub enum ListingStatus {
     Cancelled,
     Expired,
 }
-
-// ============================================================================
-// Context Structures
-// ============================================================================
 
 #[derive(Accounts)]
 pub struct InitializeMarketplace<'info> {
@@ -433,25 +401,17 @@ pub struct MintLandParcel<'info> {
     )]
     pub marketplace: Account<'info, Marketplace>,
 
-    #[account(
-        init,
-        payer = payer,
-        mint::decimals = 0,
-        mint::authority = payer,
-    )]
-    pub mint: Account<'info, Mint>,
+    /// CHECK: This account will be created and initialized as a mint
+    #[account(mut, signer)]
+    pub mint: AccountInfo<'info>,
 
-    /// CHECK: Metadata account
     #[account(mut)]
-    pub metadata: AccountInfo<'info>,
-
     pub owner: Signer<'info>,
 
     #[account(mut)]
     pub payer: Signer<'info>,
 
     pub token_program: Program<'info, Token>,
-    pub token_metadata_program: Program<'info, Metadata>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
 }
@@ -521,13 +481,15 @@ pub struct PurchaseParcel<'info> {
         mut,
         address = listing.seller @ ErrorCode::InvalidSeller
     )]
-    pub seller: SystemAccount<'info>,
+    /// CHECK: Verified by address constraint
+    pub seller: UncheckedAccount<'info>,
 
     #[account(
         mut,
         address = marketplace.treasury @ ErrorCode::InvalidTreasury
     )]
-    pub treasury: SystemAccount<'info>,
+    /// CHECK: Verified by address constraint
+    pub treasury: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -572,10 +534,6 @@ pub struct UpdateMarketplaceFee<'info> {
 
     pub authority: Signer<'info>,
 }
-
-// ============================================================================
-// Events
-// ============================================================================
 
 #[event]
 pub struct MarketplaceInitialized {
@@ -622,57 +580,38 @@ pub struct MarketplaceFeeUpdated {
     pub new_fee: u16,
 }
 
-// ============================================================================
-// Error Codes
-// ============================================================================
-
 #[error_code]
 pub enum ErrorCode {
     #[msg("Invalid coordinates provided")]
     InvalidCoordinates,
-
     #[msg("Name is too long")]
     NameTooLong,
-
     #[msg("URI is too long")]
     UriTooLong,
-
     #[msg("Fee percentage is too high")]
     FeeTooHigh,
-
     #[msg("Price is too low")]
     PriceTooLow,
-
     #[msg("Invalid expiry time")]
     InvalidExpiryTime,
-
     #[msg("Expiry time is too far in the future")]
     ExpiryTooFar,
-
     #[msg("Parcel is already listed for sale")]
     AlreadyListed,
-
     #[msg("Listing is not active")]
     ListingNotActive,
-
     #[msg("Listing has expired")]
     ListingExpired,
-
     #[msg("Not the owner of this parcel")]
     NotParcelOwner,
-
     #[msg("Not the seller of this listing")]
     NotListingSeller,
-
     #[msg("Invalid seller")]
     InvalidSeller,
-
     #[msg("Invalid treasury")]
     InvalidTreasury,
-
     #[msg("Not the marketplace authority")]
     NotMarketplaceAuthority,
-
     #[msg("Math overflow")]
     MathOverflow,
 }
